@@ -1,25 +1,5 @@
-
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2019 Kinan Mahdi
-//
-// Permission is hereby  granted, free of charge, to any  person obtaining a copy
-// of this software and associated  documentation files (the "Software"), to deal
-// in the Software  without restriction, including without  limitation the rights
-// to  use, copy,  modify, merge,  publish, distribute,  sublicense, and/or  sell
-// copies  of  the Software,  and  to  permit persons  to  whom  the Software  is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE  IS PROVIDED "AS  IS", WITHOUT WARRANTY  OF ANY KIND,  EXPRESS OR
-// IMPLIED,  INCLUDING BUT  NOT  LIMITED TO  THE  WARRANTIES OF  MERCHANTABILITY,
-// FITNESS FOR  A PARTICULAR PURPOSE AND  NONINFRINGEMENT. IN NO EVENT  SHALL THE
-// AUTHORS  OR COPYRIGHT  HOLDERS  BE  LIABLE FOR  ANY  CLAIM,  DAMAGES OR  OTHER
-// LIABILITY, WHETHER IN AN ACTION OF  CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE  OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
 
 #pragma once
 #include <atomic>
@@ -33,12 +13,28 @@
 
 namespace mtx
 {
-	class shared_recursive_mutex {
+	/**
+	* @brief Implementation of a fast shared_recursive_mutex
+	*/
+	//the template parameter is needed to be able to define multiple instances of the shared_recursive_mutex 
+	//since the implementation relies upon thread local storage we need a unique type per lock that is needed
+	//is doesn't matter what the input type is, along as it's unique (that's why it's called PhantomType)
+	template<typename PhantomType>
+	class shared_recursive_mutex_t {
 	public:
 		/**
-		 * @brief Constructs the mutex.
-		 */
-		shared_recursive_mutex() = default;
+		* @brief Copying the mutex is not allowed
+		*/
+		shared_recursive_mutex_t(const shared_recursive_mutex_t&) = delete;
+		shared_recursive_mutex_t& operator =(const shared_recursive_mutex_t&) = delete;
+		/**
+		* @brief The shared_recursive_mutex_t is relying on thread local storage, so there can only be 1 valid instance of it
+		*/
+		static shared_recursive_mutex_t& instance()
+		{
+			static shared_recursive_mutex_t instance;
+			return instance;
+		}
 
 		/**
 		 * @brief Locks the mutex for exclusive write access for this thread.
@@ -52,24 +48,21 @@ namespace mtx
 		 */
 		void lock();
 
-		bool try_lock();
-
-		bool try_lock_shared();
-
 		/**
 		 * @brief Locks the mutex for sharable read access.
-		 *              Blocks execution as long as read access is not available:
-		 *              * other thread has write access
-		 *              * other threads try to get write access
+		 *        Blocks execution as long as read access is not available:
+		 *        * other thread has write access
+		 *        * other threads try to get write access
 		 *
-		 *              A thread may call lock repeatedly.
-		 *              Ownership will only be released after the thread makes a matching number of calls to unlock_shared.
+		 *        A thread may call lock repeatedly. If the thread already has write access the level of write access will be increased.
+		 *        Ownership will only be released after the thread makes a matching number of calls to unlock_shared.
 		 */
 		void lock_shared();
 
 		/**
-		 * @brief Unlocks the mutex for this thread if its level of ownership is 1. Otherwise reduces the level of ownership
-		 *              by 1.
+		 * @brief Unlocks the mutex for this thread if its level of write ownership is 1 and has no read ownership.
+		 *        If the thread has write ownership of 1 and read ownership, the mutex will change from write to read access.
+		 *		  Otherwise reduces the level of ownership by 1.
 		 */
 		void unlock();
 
@@ -78,153 +71,144 @@ namespace mtx
 		 *              by 1.
 		 */
 		void unlock_shared();
+		/**
+		* @brief Tries to get write ownership if possible. If the thread has read (but no write) ownership this function returns false,
+		*        because to upgrade a read lock to a write lock we have to give up read ownership, so if we can't aquire write ownership
+		*        we have to reaquire the read ownership again, which might be a blocking operation. Use try_lock_upgrade is this
+		*		 is the wanted behavior.
+		*/
+		bool try_lock();
+		/**
+		* @brief Tries to get read ownership if possible.
+		*/
+		bool try_lock_shared();
+		/**
+		* @brief Returns if this thread has write ownership.
+		*/
+		bool is_locked() const;
+		/**
+		* @brief Returns true if this thread has only read ownership.
+		*/
+		bool is_locked_shared() const;
 
 	private:
-		// protects for race conditions of member accesses
+		shared_recursive_mutex_t() = default;
+
 		std::shared_mutex m_sharedMtx;
-		std::shared_mutex m_mtx;
-		// level of (recursive) read accesses
-		struct OwnerShipLevel
-		{
-			uint32_t readers = 0;
-			uint32_t writers = 0;
-		};
-		using OwnerShipMap = std::unordered_map<std::thread::id, OwnerShipLevel>;
-		OwnerShipMap m_threadOwnership;
+		static inline thread_local uint32_t g_readers = 0;
+		static inline thread_local uint32_t g_writers = 0;
 	};
-	void shared_recursive_mutex::lock()
+
+	template<typename PhantomType>
+	void shared_recursive_mutex_t<PhantomType>::lock()
 	{
-		const auto threadId = std::this_thread::get_id();
-		OwnerShipMap::iterator ownerShipIt;
+		if (g_writers == 0 && g_readers == 0)
 		{
-			std::shared_lock<std::shared_mutex> lock(m_mtx);
-			ownerShipIt = m_threadOwnership.find(threadId);
-		}
-		// Increase level of ownership if thread has already exclusive ownership.
-		if (ownerShipIt == end(m_threadOwnership))
-		{
-			{
-				std::unique_lock<std::shared_mutex> lock(m_mtx);
-				m_threadOwnership.emplace(threadId, OwnerShipLevel{ 0, 1 });
-			}
 			m_sharedMtx.lock();
-			return;
 		}
-		auto& ownerShipLevel = ownerShipIt->second;
-		if (ownerShipLevel.readers > 0 && ownerShipLevel.writers == 0)
+		else if (g_writers == 0 && g_readers > 0)
 		{
-			++ownerShipLevel.writers;
 			m_sharedMtx.unlock_shared();
 			m_sharedMtx.lock();
 		}
-		else if (ownerShipLevel.writers > 0)
-		{
-			++ownerShipLevel.writers;
-		}
-		else
-		{
-			assert(false);
-		};
+		++g_writers;
 	}
-
-	void shared_recursive_mutex::lock_shared()
+	template<typename PhantomType>
+	void shared_recursive_mutex_t<PhantomType>::lock_shared()
 	{
-		const auto threadId = std::this_thread::get_id();
-		OwnerShipMap::iterator ownerShipIt;
+		//if we are locking shared
+		if (g_writers > 0)
 		{
-			std::shared_lock<std::shared_mutex> lock(m_mtx);
-			ownerShipIt = m_threadOwnership.find(threadId);
+			++g_writers;
 		}
-		//check if this thread had no ownership before
-		if (ownerShipIt == end(m_threadOwnership))
+		else if (g_readers > 0)
 		{
-			{
-				std::unique_lock<std::shared_mutex> lock(m_mtx);
-				m_threadOwnership.emplace(threadId, OwnerShipLevel{ 1, 0 });
-			}
+			++g_readers;
+		}
+		else if (g_readers == 0)
+		{
 			m_sharedMtx.lock_shared();
+			++g_readers;
+		}
+	}
+	template<typename PhantomType>
+	void shared_recursive_mutex_t<PhantomType>::unlock()
+	{
+		--g_writers;
+		if (g_writers > 0)
+			return;
+		if (g_writers == 0)
+		{
+			m_sharedMtx.unlock();
+			if (g_readers > 0)
+				m_sharedMtx.lock_shared();
+		}
+	}
+	template<typename PhantomType>
+	void shared_recursive_mutex_t<PhantomType>::unlock_shared()
+	{
+		//if the g_writers are > 0 it means that when we got the read lock, this thread already has the write lock
+		if (g_writers > 0)
+		{
+			unlock();
 			return;
 		}
-		auto& ownerShipLevel = ownerShipIt->second;
-		if (ownerShipLevel.writers == 0 && ownerShipLevel.readers == 0)
+		--g_readers;
+		if (g_readers == 0)
 		{
-			ownerShipLevel.readers = 1;
-			m_sharedMtx.lock_shared();
-		}
-		else
-		{
-			++ownerShipLevel.readers;
-		}
-	}
-
-	void shared_recursive_mutex::unlock()
-	{
-		const auto threadId = std::this_thread::get_id();
-		OwnerShipMap::iterator ownerShipIt;
-		{
-			std::shared_lock<std::shared_mutex> lock(m_mtx);
-			ownerShipIt = m_threadOwnership.find(threadId);
-		}
-		//check if this thread had no ownership before
-		assert(ownerShipIt != m_threadOwnership.end());
-
-		auto& ownerShipLevel = ownerShipIt->second;
-		if (ownerShipLevel.writers == 1 && ownerShipLevel.readers == 0)
-		{
-			ownerShipLevel.writers = 0;
-			m_sharedMtx.unlock();
-		}
-		else if (ownerShipLevel.writers == 1 && ownerShipLevel.readers > 0)
-		{
-			--ownerShipLevel.writers;
-			m_sharedMtx.unlock();
-			m_sharedMtx.lock_shared();
-		}
-		else if (ownerShipLevel.writers > 0)
-		{
-			--ownerShipLevel.writers;
-		}
-		else
-		{
-			assert(false && "lock called without write access!");
-		}
-	}
-
-	void shared_recursive_mutex::unlock_shared()
-	{
-		const auto threadId = std::this_thread::get_id();
-		OwnerShipMap::iterator ownerShipIt;
-		{
-			std::shared_lock<std::shared_mutex> lock(m_mtx);
-			ownerShipIt = m_threadOwnership.find(threadId);
-		}
-		//check if this thread had no ownership before
-		if (ownerShipIt == m_threadOwnership.end())
-			return;
-
-		auto& ownerShipLevel = ownerShipIt->second;
-		if (ownerShipLevel.writers == 0 && ownerShipLevel.readers == 1)
-		{
-			ownerShipLevel.readers = 0;
 			m_sharedMtx.unlock_shared();
 		}
-		else if (ownerShipLevel.readers > 0)
+	}
+	template<typename PhantomType>
+	bool shared_recursive_mutex_t<PhantomType>::try_lock()
+	{
+		//we already have the lock, so we can simply increase the writer count
+		if (g_writers > 0)
 		{
-			ownerShipLevel.readers--;
+			++g_writers;
+			return true;
 		}
-		else
+		//we already have a read lock, but we can't aquire the write lock without giving up the read lock
+		//so we have to return false here
+		if (g_readers > 0)
 		{
-			assert(false && "unlock_shared called without read access!");
+			return false;
 		}
+		const bool aquiredLock = m_sharedMtx.try_lock();
+		if (aquiredLock)
+		{
+			++g_writers;
+		}
+
+		return aquiredLock;
+	}
+	template<typename PhantomType>
+	bool shared_recursive_mutex_t<PhantomType>::try_lock_shared()
+	{
+		//we already have the lock, so we can simply increase the lock count
+		if (g_writers > 0 || g_readers > 0)
+		{
+			lock_shared();
+			return true;
+		}
+		const bool aquiredLock = m_sharedMtx.try_lock_shared();
+		if (aquiredLock)
+		{
+			++g_readers;
+		}
+		return aquiredLock;
+	}
+	template<typename PhantomType>
+	bool shared_recursive_mutex_t<PhantomType>::is_locked() const
+	{
+		return g_writers > 0;
+	}
+	template<typename PhantomType>
+	bool shared_recursive_mutex_t<PhantomType>::is_locked_shared() const
+	{
+		return g_readers > 0 && g_writers == 0;
 	}
 
-	bool shared_recursive_mutex::try_lock()
-	{
-		return false;
-	}
+	using shared_recursive_global_mutex = shared_recursive_mutex_t<struct AnonymousType>;
 
-	bool shared_recursive_mutex::try_lock_shared()
-	{
-		return false;
-	}
 }
