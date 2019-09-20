@@ -1,0 +1,8 @@
+﻿add_executable(shared_recursive_mutex_example)
+target_sources(shared_recursive_mutex_example PRIVATE example.cpp)
+target_link_libraries(shared_recursive_mutex_example PRIVATE shared_recursive_mutex)
+if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+    target_compile_options(shared_recursive_mutex_example PRIVATE /W4 /permissive-)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(shared_recursive_mutex_example PRIVATE -Wall -Wextra -pedantic-errors)
+endif()
