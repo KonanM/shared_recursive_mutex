@@ -77,19 +77,19 @@ namespace mtx
 		*        we have to reaquire the read ownership again, which might be a blocking operation. Use try_lock_upgrade is this
 		*		 is the wanted behavior.
 		*/
-		bool try_lock();
+		[[nodiscard]] bool try_lock();
 		/**
 		* @brief Tries to get read ownership if possible.
 		*/
-		bool try_lock_shared();
+		[[nodiscard]] bool try_lock_shared();
 		/**
 		* @brief Returns if this thread has write ownership.
 		*/
-		bool is_locked() const;
+		[[nodiscard]] bool is_locked() const;
 		/**
 		* @brief Returns true if this thread has only read ownership.
 		*/
-		bool is_locked_shared() const;
+		[[nodiscard]]  bool is_locked_shared() const;
 
 	private:
 		shared_recursive_mutex_t() = default;
